@@ -4106,13 +4106,6 @@ class AlgorithmConfig(_Config):
     def _validate_input_settings(self):
         """Checks, whether input related settings make sense."""
 
-        if self.input_ == "sampler" and self.off_policy_estimation_methods:
-            raise ValueError(
-                "Off-policy estimation methods can only be used if the input is a "
-                "dataset. We currently do not support applying off_policy_estimation_"
-                "method on a sampler input."
-            )
-
         if self.input_ == "dataset":
             # If you need to read a Ray dataset set the parallelism and
             # num_cpus_per_read_task from rollout worker settings

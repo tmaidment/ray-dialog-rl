@@ -24,6 +24,7 @@ from ray.rllib.execution.buffers.mixin_replay_buffer import MixInMultiAgentRepla
 from ray.rllib.execution.learner_thread import LearnerThread
 from ray.rllib.execution.multi_gpu_learner_thread import MultiGPULearnerThread
 from ray.rllib.policy.policy import Policy
+from ray.rllib.policy.sample_batch import DEFAULT_POLICY_ID
 from ray.rllib.policy.sample_batch import concat_samples
 from ray.rllib.utils.actor_manager import (
     FaultAwareApply,
@@ -1305,6 +1306,13 @@ class IMPALA(Algorithm):
                 self._counters[NUM_AGENT_STEPS_TRAINED] += r[ALL_MODULES].pop(
                     NUM_MODULE_STEPS_TRAINED
                 )
+
+            if self.reward_estimators:
+                results[DEFAULT_POLICY_ID]["off_policy_estimation"] = {}
+                for name, estimator in self.reward_estimators.items():
+                    results[DEFAULT_POLICY_ID]["off_policy_estimation"][
+                        name
+                    ] = estimator.train(batch)
 
         self._counters.update(self.learner_group.get_stats())
         # If there are results, reduce-mean over each individual value and return.
