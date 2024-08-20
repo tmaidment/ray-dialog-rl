@@ -1052,6 +1052,18 @@ class IMPALA(Algorithm):
         for batch in batches:
             self._counters[NUM_ENV_STEPS_SAMPLED] += batch.count
             self._counters[NUM_AGENT_STEPS_SAMPLED] += batch.agent_steps()
+
+        # update the reward estimators
+        results = {}
+        for batch in batches:
+            if self.reward_estimators:
+                results["off_policy_estimation"] = {}
+                for name, estimator in self.reward_estimators.items():
+                    results["off_policy_estimation"][
+                        name
+                    ] = estimator.train(batch)
+
+
         # Concatenate single batches into batches of size `total_train_batch_size`.
         self._concatenate_batches_and_pre_queue(batches)
         # Move train batches (of size `total_train_batch_size`) onto learner queue.
@@ -1076,6 +1088,9 @@ class IMPALA(Algorithm):
                 timeout_seconds=self.config.env_runner_health_probe_timeout_s,
                 mark_healthy=True,
             )
+
+        # combine all results
+        train_results.update(results)
 
         return train_results
 
@@ -1306,13 +1321,6 @@ class IMPALA(Algorithm):
                 self._counters[NUM_AGENT_STEPS_TRAINED] += r[ALL_MODULES].pop(
                     NUM_MODULE_STEPS_TRAINED
                 )
-
-            if self.reward_estimators:
-                results[DEFAULT_POLICY_ID]["off_policy_estimation"] = {}
-                for name, estimator in self.reward_estimators.items():
-                    results[DEFAULT_POLICY_ID]["off_policy_estimation"][
-                        name
-                    ] = estimator.train(batch)
 
         self._counters.update(self.learner_group.get_stats())
         # If there are results, reduce-mean over each individual value and return.
