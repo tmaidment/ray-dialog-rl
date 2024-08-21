@@ -1,9 +1,11 @@
 import copy
 from functools import partial
 import logging
+import multiprocessing as mp
 import platform
 import queue
 import random
+import threading
 from typing import List, Optional, Set, Tuple, Type, Union
 
 import numpy as np
@@ -26,6 +28,7 @@ from ray.rllib.execution.multi_gpu_learner_thread import MultiGPULearnerThread
 from ray.rllib.policy.policy import Policy
 from ray.rllib.policy.sample_batch import DEFAULT_POLICY_ID
 from ray.rllib.policy.sample_batch import concat_samples
+from ray.rllib.policy.sample_batch import MultiAgentBatch
 from ray.rllib.utils.actor_manager import (
     FaultAwareApply,
     FaultTolerantActorManager,
@@ -34,6 +37,7 @@ from ray.rllib.utils.actor_manager import (
 from ray.rllib.utils.actors import create_colocated_actors
 from ray.rllib.utils.annotations import OldAPIStack, override
 from ray.rllib.utils.deprecation import DEPRECATED_VALUE, deprecation_warning
+from ray.rllib.utils.framework import try_import_torch
 from ray.rllib.utils.metrics import (
     ALL_MODULES,
     ENV_RUNNER_RESULTS,
@@ -71,6 +75,8 @@ from ray.rllib.utils.typing import (
 )
 from ray.tune.execution.placement_groups import PlacementGroupFactory
 from ray.util.annotations import DeveloperAPI
+
+torch, nn = try_import_torch()
 
 
 logger = logging.getLogger(__name__)
@@ -647,6 +653,15 @@ class IMPALA(Algorithm):
             self._learner_thread = make_learner_thread(self.env_runner, self.config)
             self._learner_thread.start()
 
+            # Initialize and start the reward estimator learner thread
+            if self.reward_estimators:
+                self._reward_estimator_learner_process = RewardEstimatorLearnerProcess(
+                    reward_estimators=self.reward_estimators,
+                    learner_queue_size=self.config.learner_queue_size,
+                    learner_queue_timeout=self.config.learner_queue_timeout
+                )
+                self._reward_estimator_learner_process.start()
+
     @override(Algorithm)
     def training_step(self) -> ResultDict:
         # Old- and hybrid API stacks.
@@ -1052,20 +1067,15 @@ class IMPALA(Algorithm):
         for batch in batches:
             self._counters[NUM_ENV_STEPS_SAMPLED] += batch.count
             self._counters[NUM_AGENT_STEPS_SAMPLED] += batch.agent_steps()
-
-        # update the reward estimators
-        results = {}
-        for batch in batches:
-            if self.reward_estimators:
-                results["off_policy_estimation"] = {}
-                for name, estimator in self.reward_estimators.items():
-                    results["off_policy_estimation"][
-                        name
-                    ] = estimator.train(batch)
-
-
         # Concatenate single batches into batches of size `total_train_batch_size`.
         self._concatenate_batches_and_pre_queue(batches)
+        # update the reward estimators
+        for batch in self.data_to_place_on_learner:
+            if self.reward_estimators:
+                try:
+                    self._reward_estimator_learner_process.inqueue.put(batch, block=False)
+                except queue.Full:
+                    logger.warning("Reward estimator learner queue is full.")
         # Move train batches (of size `total_train_batch_size`) onto learner queue.
         self._place_processed_samples_on_learner_thread_queue()
         # Extract most recent train results from learner thread.
@@ -1090,7 +1100,14 @@ class IMPALA(Algorithm):
             )
 
         # combine all results
-        train_results.update(results)
+        while not self._reward_estimator_learner_process.outqueue.empty():
+            logging.info("Logging reward estimator learner results")
+            # ensure the logging was correct
+            
+            self.metrics.log_dict(self._reward_estimator_learner_process.outqueue.get(), key=(LEARNER_GROUP))
+            #train_results[DEFAULT_POLICY_ID].update(self._reward_estimator_learner_process.outqueue.get())
+            logging.warning(self.metrics.peek(LEARNER_GROUP))
+        
 
         return train_results
 
@@ -1463,7 +1480,6 @@ class IMPALA(Algorithm):
             )
         return result
 
-
 Impala = IMPALA
 
 
@@ -1561,3 +1577,49 @@ def make_learner_thread(local_worker, config):
             learner_queue_timeout=config["learner_queue_timeout"],
         )
     return learner_thread
+
+
+class RewardEstimatorLearnerProcess(mp.Process):
+    def __init__(self, reward_estimators, learner_queue_size, learner_queue_timeout):
+        super().__init__()
+        self.reward_estimators = reward_estimators
+        self.inqueue = mp.Queue(maxsize=learner_queue_size)
+        self.outqueue = mp.Queue()
+        self.learner_queue_timeout = learner_queue_timeout
+        self.stop_flag = mp.Event()
+
+    def run(self):
+        while not self.stop_flag.is_set():
+            try:
+                batch = self.inqueue.get(timeout=self.learner_queue_timeout)
+                if batch is None:
+                    break
+                logger.info("Batch received by RewardEstimatorLearnerProcess")
+                
+                results = self.process_batch(batch)
+                
+                try:
+                    self.outqueue.put(results, timeout=self.learner_queue_timeout)
+                    logger.info("Results stored by RewardEstimatorLearnerProcess")
+                except mp.Queue.Full:
+                    logger.warning("Output queue is full. Results discarded.")
+            
+            except mp.Queue.Empty:
+                logger.debug("Input queue timeout. Continuing...")
+            except Exception as e:
+                logger.exception(f"Error in RewardEstimatorLearnerProcess: {e}")
+
+    def process_batch(self, batch):
+        results = {}
+        if self.reward_estimators:
+            results["off_policy_estimation"] = {}
+            for name, estimator in self.reward_estimators.items():
+                try:
+                    results["off_policy_estimation"][name] = estimator.train(batch)
+                except Exception as e:
+                    logger.error(f"Error training estimator {name}: {e}")
+        return results
+
+    def stop(self):
+        self.stop_flag.set()
+        self.inqueue.put(None)
