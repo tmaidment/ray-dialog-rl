@@ -655,9 +655,10 @@ class IMPALA(Algorithm):
 
             # Initialize and start the reward estimator learner thread
             if self.reward_estimators:
+                self.reward_estimator_learner_results = {}
                 self._reward_estimator_learner_process = RewardEstimatorLearnerProcess(
                     reward_estimators=self.reward_estimators,
-                    learner_queue_size=self.config.learner_queue_size,
+                    learner_queue_size=self.config.learner_queue_size*32,
                     learner_queue_timeout=self.config.learner_queue_timeout
                 )
                 self._reward_estimator_learner_process.start()
@@ -1068,14 +1069,14 @@ class IMPALA(Algorithm):
             self._counters[NUM_ENV_STEPS_SAMPLED] += batch.count
             self._counters[NUM_AGENT_STEPS_SAMPLED] += batch.agent_steps()
         # Concatenate single batches into batches of size `total_train_batch_size`.
-        self._concatenate_batches_and_pre_queue(batches)
         # update the reward estimators
-        for batch in self.data_to_place_on_learner:
+        for batch in batches:
             if self.reward_estimators:
                 try:
                     self._reward_estimator_learner_process.inqueue.put(batch, block=False)
                 except queue.Full:
                     logger.warning("Reward estimator learner queue is full.")
+        self._concatenate_batches_and_pre_queue(batches)
         # Move train batches (of size `total_train_batch_size`) onto learner queue.
         self._place_processed_samples_on_learner_thread_queue()
         # Extract most recent train results from learner thread.
@@ -1102,13 +1103,10 @@ class IMPALA(Algorithm):
         # combine all results
         while not self._reward_estimator_learner_process.outqueue.empty():
             logging.info("Logging reward estimator learner results")
-            # ensure the logging was correct
-            
-            self.metrics.log_dict(self._reward_estimator_learner_process.outqueue.get(), key=(LEARNER_GROUP))
-            #train_results[DEFAULT_POLICY_ID].update(self._reward_estimator_learner_process.outqueue.get())
-            logging.warning(self.metrics.peek(LEARNER_GROUP))
-        
+            self.reward_estimator_learner_results.update(self._reward_estimator_learner_process.outqueue.get())
 
+        train_results.update(self.reward_estimator_learner_results)
+    
         return train_results
 
     @OldAPIStack
