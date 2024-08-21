@@ -1069,14 +1069,14 @@ class IMPALA(Algorithm):
             self._counters[NUM_ENV_STEPS_SAMPLED] += batch.count
             self._counters[NUM_AGENT_STEPS_SAMPLED] += batch.agent_steps()
         # Concatenate single batches into batches of size `total_train_batch_size`.
+        self._concatenate_batches_and_pre_queue(batches)
         # update the reward estimators
-        for batch in batches:
+        for batch in self.data_to_place_on_learner:
             if self.reward_estimators:
                 try:
                     self._reward_estimator_learner_process.inqueue.put(batch, block=False)
                 except queue.Full:
                     logger.warning("Reward estimator learner queue is full.")
-        self._concatenate_batches_and_pre_queue(batches)
         # Move train batches (of size `total_train_batch_size`) onto learner queue.
         self._place_processed_samples_on_learner_thread_queue()
         # Extract most recent train results from learner thread.
