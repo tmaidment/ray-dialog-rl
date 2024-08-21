@@ -1105,7 +1105,8 @@ class IMPALA(Algorithm):
             logging.info("Logging reward estimator learner results")
             self.reward_estimator_learner_results.update(self._reward_estimator_learner_process.outqueue.get())
 
-        train_results.update(self.reward_estimator_learner_results)
+        if DEFAULT_POLICY_ID in train_results:
+            train_results[DEFAULT_POLICY_ID].update(self.reward_estimator_learner_results)
     
         return train_results
 
