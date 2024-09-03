@@ -666,23 +666,11 @@ class IMPALA(Algorithm):
 
         # Initialize shared reward estimators
         self.shared_reward_estimators = {}
-        ope_types = {
-            "is": ImportanceSampling,
-            "wis": WeightedImportanceSampling,
-            "dm": DirectMethod,
-            "dr": DoublyRobust,
-        }
-
         policy = self.get_policy()
-        policy_config = policy.config.copy()
-        policy_config["observation_space"] = policy.observation_space
-        policy_config["action_space"] = policy.action_space
 
         for name, method_config in self.config.off_policy_estimation_methods.items():
             method_type = method_config.pop("type")
-            if method_type in ope_types:
-                method_type = ope_types[method_type]
-            elif isinstance(method_type, str):
+            if isinstance(method_type, str):
                 logger.log(0, f"Trying to import from string: {method_type}")
                 mod, obj = method_type.rsplit(".", 1)
                 mod = importlib.import_module(mod)
@@ -692,13 +680,12 @@ class IMPALA(Algorithm):
                 if issubclass(method_type, OffPolicyEstimator):
                     method_config["gamma"] = self.config.gamma
                 self.shared_reward_estimators[name] = SharedRewardEstimator.remote(
-                    method_type, policy_config, **method_config
+                    method_type, policy, **method_config
                 )
             else:
                 raise ValueError(
                     f"Unknown off_policy_estimation type: {method_type}! Must be "
-                    "either a class path or a sub-class of ray.rllib."
-                    "offline.offline_evaluator::OfflineEvaluator"
+                    "a sub-class of ray.rllib.offline.offline_evaluator::OfflineEvaluator"
                 )
 
             # Add back method_type in case Algorithm is restored from checkpoint
@@ -1139,6 +1126,12 @@ class IMPALA(Algorithm):
                 mark_healthy=True,
             )
 
+        # After policy updates, sync weights with reward estimators
+        policy_weights = self.get_policy().get_weights()
+        weight_ref = ray.put(policy_weights)
+        for estimator in self.shared_reward_estimators.values():
+            estimator.set_weights.remote(weight_ref)
+
         # Collect results from reward estimators
         estimator_results = ray.get(estimator_futures)
 
@@ -1159,22 +1152,13 @@ class IMPALA(Algorithm):
         self,
         parallel_train_future: Optional[concurrent.futures.ThreadPoolExecutor] = None,
     ) -> ResultDict:
-        # Sync reward estimators with the shared ones before evaluation
+        # Get weights from shared estimators before evaluation
         self.reward_estimators = {}
         for name, shared_estimator in self.shared_reward_estimators.items():
-            state = ray.get(shared_estimator.get_state.remote())
-            method_config = self.config.off_policy_estimation_methods[name].copy()
-            method_type = method_config.pop("type")
-            policy = self.get_policy()
-            if issubclass(method_type, OffPolicyEstimator):
-                method_config["gamma"] = self.config.gamma
-            self.reward_estimators[name] = method_type(policy, **method_config)
-            if state is not None and hasattr(self.reward_estimators[name], 'model'):
-                self.reward_estimators[name].model.set_state(state)
+            weights = ray.get(shared_estimator.get_weights.remote())
+            self.reward_estimators[name].set_weights(weights)
         
-        eval_results = super().evaluate(parallel_train_future)
-
-        return eval_results
+        return super().evaluate(parallel_train_future)
 
     @OldAPIStack
     def _get_samples_from_workers_old_and_hybrid_api_stack(
@@ -1646,23 +1630,24 @@ def make_learner_thread(local_worker, config):
 
 @ray.remote
 class SharedRewardEstimator:
-    def __init__(self, estimator_class, policy_config, **kwargs):
-        from ray.rllib.algorithms.impala.impala_torch_policy import ImpalaTorchPolicy
-        
-        dummy_policy = ImpalaTorchPolicy(policy_config["observation_space"], policy_config["action_space"], policy_config)
-        self.estimator = estimator_class(dummy_policy, **kwargs)
+    def __init__(self, estimator_class, policy, **kwargs):
+        self.estimator = estimator_class(policy, **kwargs)
 
     def train(self, batch):
         return self.estimator.train(batch)
 
-    def get_state(self):
-        if hasattr(self.estimator, 'model') and hasattr(self.estimator.model, 'get_state'):
-            return self.estimator.model.get_state()
+    def get_weights(self):
+        if hasattr(self.estimator, 'get_weights'):
+            return self.estimator.get_weights()
+        elif hasattr(self.estimator, 'model') and hasattr(self.estimator.model, 'get_weights'):
+            return self.estimator.model.get_weights()
         return None
 
-    def set_state(self, state):
-        if state is not None and hasattr(self.estimator, 'model') and hasattr(self.estimator.model, 'set_state'):
-            self.estimator.model.set_state(state)
+    def set_weights(self, weights):
+        if hasattr(self.estimator, 'set_weights'):
+            self.estimator.set_weights(weights)
+        elif hasattr(self.estimator, 'model') and hasattr(self.estimator.model, 'set_weights'):
+            self.estimator.model.set_weights(weights)
 
     def get_estimator_class(self):
         return type(self.estimator)
