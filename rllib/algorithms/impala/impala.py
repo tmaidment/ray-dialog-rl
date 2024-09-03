@@ -672,6 +672,11 @@ class IMPALA(Algorithm):
             "dr": DoublyRobust,
         }
 
+        policy = self.get_policy()
+        policy_config = policy.config.copy()
+        policy_config["observation_space"] = policy.observation_space
+        policy_config["action_space"] = policy.action_space
+
         for name, method_config in self.config.off_policy_estimation_methods.items():
             method_type = method_config.pop("type")
             if method_type in ope_types:
@@ -683,11 +688,10 @@ class IMPALA(Algorithm):
                 method_type = getattr(mod, obj)
 
             if isinstance(method_type, type) and issubclass(method_type, OfflineEvaluator):
-                policy = self.get_policy()
                 if issubclass(method_type, OffPolicyEstimator):
                     method_config["gamma"] = self.config.gamma
                 self.shared_reward_estimators[name] = SharedRewardEstimator.remote(
-                    method_type, policy, **method_config
+                    method_type, policy_config, **method_config
                 )
             else:
                 raise ValueError(
@@ -1637,8 +1641,11 @@ def make_learner_thread(local_worker, config):
 
 @ray.remote
 class SharedRewardEstimator:
-    def __init__(self, estimator_class, policy, **kwargs):
-        self.estimator = estimator_class(policy, **kwargs)
+    def __init__(self, estimator_class, policy_config, **kwargs):
+        from ray.rllib.algorithms.impala.impala_torch_policy import ImpalaTorchPolicy
+        
+        dummy_policy = ImpalaTorchPolicy(policy_config["observation_space"], policy_config["action_space"], policy_config)
+        self.estimator = estimator_class(dummy_policy, **kwargs)
 
     def train(self, batch):
         return self.estimator.train(batch)
