@@ -1655,7 +1655,13 @@ class SharedRewardEstimator:
         return self.estimator.train(batch)
 
     def get_state(self):
-        return self.estimator.get_state()
+        if hasattr(self.estimator, 'model') and hasattr(self.estimator.model, 'get_state'):
+            return self.estimator.model.get_state()
+        return None
 
     def set_state(self, state):
-        self.estimator.set_state(state)
+        if state is not None and hasattr(self.estimator, 'model') and hasattr(self.estimator.model, 'set_state'):
+            self.estimator.model.set_state(state)
+
+    def get_estimator_class(self):
+        return type(self.estimator)
