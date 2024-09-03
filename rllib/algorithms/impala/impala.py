@@ -656,7 +656,7 @@ class IMPALA(Algorithm):
         # Create shared reward estimators as Ray actors
         self.shared_reward_estimators = {
             name: SharedRewardEstimator.remote(estimator_class, *args, **kwargs)
-            for name, (estimator_class, args, kwargs) in config.reward_estimators.items()
+            for name, (estimator_class, args, kwargs) in config.off_policy_estimation_methods.items()
         }
 
     @override(Algorithm)
@@ -1116,7 +1116,7 @@ class IMPALA(Algorithm):
             state = ray.get(shared_estimator.get_state.remote())
             if name not in self.reward_estimators:
                 # If the estimator doesn't exist, create it
-                estimator_class, args, kwargs = self.config.reward_estimators[name]
+                estimator_class, args, kwargs = self.config.off_policy_estimation_methods[name]
                 self.reward_estimators[name] = estimator_class(*args, **kwargs)
             # Update the state of the existing estimator
             self.reward_estimators[name].set_state(state)
