@@ -1,4 +1,5 @@
 import copy
+import concurrent
 from functools import partial
 import importlib
 import logging
@@ -1154,7 +1155,10 @@ class IMPALA(Algorithm):
         return train_results
     
     @override(Algorithm)
-    def evaluate(self):
+    def evaluate(
+        self,
+        parallel_train_future: Optional[concurrent.futures.ThreadPoolExecutor] = None,
+    ) -> ResultDict:
         # Sync reward estimators with the shared ones before evaluation
         self.reward_estimators = {}
         for name, shared_estimator in self.shared_reward_estimators.items():
@@ -1166,8 +1170,8 @@ class IMPALA(Algorithm):
                 method_config["gamma"] = self.config.gamma
             self.reward_estimators[name] = method_type(policy, **method_config)
             self.reward_estimators[name].set_state(state)
-
-        eval_results = super().evaluate()
+        
+        eval_results = super().evaluate(parallel_train_future)
 
         return eval_results
 
