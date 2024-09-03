@@ -674,9 +674,8 @@ class IMPALA(Algorithm):
         for name, method_config in self.config.off_policy_estimation_methods.items():
             method_type = method_config.pop("type")
             if issubclass(method_type, OffPolicyEstimator):
-                #method_config["gamma"] = self.config.gamma
                 self.shared_fqe_models[name] = SharedFQETorchModel.remote(
-                    policy_config, self.config.gamma, **method_config
+                    policy_config, **method_config
                 )
             else:
                 raise ValueError(
@@ -1626,12 +1625,12 @@ def make_learner_thread(local_worker, config):
 
 @ray.remote
 class SharedFQETorchModel:
-    def __init__(self, policy_config, gamma, **kwargs):
+    def __init__(self, policy_config, **kwargs):
         from ray.rllib.algorithms.impala.impala_torch_policy import ImpalaTorchPolicy
         from ray.rllib.offline.estimators.fqe_torch_model import FQETorchModel
         
         dummy_policy = ImpalaTorchPolicy(policy_config["observation_space"], policy_config["action_space"], policy_config)
-        self.model = FQETorchModel(dummy_policy, gamma, **kwargs)
+        self.model = FQETorchModel(dummy_policy, **kwargs)
 
     def train(self, batch):
         return self.model.train(batch)
