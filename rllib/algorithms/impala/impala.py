@@ -664,15 +664,8 @@ class IMPALA(Algorithm):
             self._learner_thread = make_learner_thread(self.env_runner, self.config)
             self._learner_thread.start()
 
-        # Initialize shared reward estimators
-        self.shared_reward_estimators = {}
-        ope_types = {
-            "is": ImportanceSampling,
-            "wis": WeightedImportanceSampling,
-            "dm": DirectMethod,
-            "dr": DoublyRobust,
-        }
-
+        # Initialize shared FQE models
+        self.shared_fqe_models = {}
         policy = self.get_policy()
         policy_config = policy.config.copy()
         policy_config["observation_space"] = policy.observation_space
@@ -680,25 +673,15 @@ class IMPALA(Algorithm):
 
         for name, method_config in self.config.off_policy_estimation_methods.items():
             method_type = method_config.pop("type")
-            if method_type in ope_types:
-                method_type = ope_types[method_type]
-            elif isinstance(method_type, str):
-                logger.log(0, f"Trying to import from string: {method_type}")
-                mod, obj = method_type.rsplit(".", 1)
-                mod = importlib.import_module(mod)
-                method_type = getattr(mod, obj)
-
-            if isinstance(method_type, type) and issubclass(method_type, OfflineEvaluator):
-                if issubclass(method_type, OffPolicyEstimator):
-                    method_config["gamma"] = self.config.gamma
-                self.shared_reward_estimators[name] = SharedRewardEstimator.remote(
-                    method_type, policy_config, **method_config
+            if issubclass(method_type, OffPolicyEstimator):
+                method_config["gamma"] = self.config.gamma
+                self.shared_fqe_models[name] = SharedFQETorchModel.remote(
+                    policy_config, self.config.gamma, **method_config
                 )
             else:
                 raise ValueError(
                     f"Unknown off_policy_estimation type: {method_type}! Must be "
-                    "either a class path or a sub-class of ray.rllib."
-                    "offline.offline_evaluator::OfflineEvaluator"
+                    "a sub-class of ray.rllib.offline.estimators.off_policy_estimator::OffPolicyEstimator"
                 )
 
             # Add back method_type in case Algorithm is restored from checkpoint
@@ -1114,8 +1097,8 @@ class IMPALA(Algorithm):
         # Move train batches to the reward_estimator_trainer
         estimator_futures = []
         for batch in self.data_to_place_on_learner:
-            for name, estimator in self.shared_reward_estimators.items():
-                estimator_futures.append(estimator.train.remote(batch))
+            for name, fqe_model in self.shared_fqe_models.items():
+                estimator_futures.append(fqe_model.train.remote(batch))
         # Move train batches (of size `total_train_batch_size`) onto learner queue.
         self._place_processed_samples_on_learner_thread_queue()
         # Extract most recent train results from learner thread.
@@ -1139,12 +1122,12 @@ class IMPALA(Algorithm):
                 mark_healthy=True,
             )
 
-        # Collect results from reward estimators
+        # Collect results from FQE models
         estimator_results = ray.get(estimator_futures)
 
         # Process estimator results
         off_policy_estimation = {}
-        for name, result in zip(self.shared_reward_estimators.keys(), estimator_results):
+        for name, result in zip(self.shared_fqe_models.keys(), estimator_results):
             off_policy_estimation[name] = result
 
         # Add off-policy estimation results to train results
@@ -1159,16 +1142,19 @@ class IMPALA(Algorithm):
         self,
         parallel_train_future: Optional[concurrent.futures.ThreadPoolExecutor] = None,
     ) -> ResultDict:
-        # Sync reward estimators with the shared ones before evaluation
-        self.reward_estimators = {}
-        for name, shared_estimator in self.shared_reward_estimators.items():
-            state = ray.get(shared_estimator.get_state.remote())
-            if state is not None and hasattr(self.reward_estimators[name], 'model'):
-                self.reward_estimators[name].model.set_state(state)
+        # Sync FQE models with the shared ones before evaluation
+        self.fqe_models = {}
+        for name, shared_model in self.shared_fqe_models.items():
+            state = ray.get(shared_model.get_state.remote())
+            method_config = self.config.off_policy_estimation_methods[name].copy()
+            method_type = method_config.pop("type")
+            policy = self.get_policy()
+            if issubclass(method_type, OffPolicyEstimator):
+                method_config["gamma"] = self.config.gamma
+                self.fqe_models[name] = method_type(policy, **method_config)
+                self.fqe_models[name].model.set_state(state)
         
-        eval_results = super().evaluate(parallel_train_future)
-
-        return eval_results
+        return super().evaluate(parallel_train_future)
 
     @OldAPIStack
     def _get_samples_from_workers_old_and_hybrid_api_stack(
@@ -1639,24 +1625,16 @@ def make_learner_thread(local_worker, config):
 
 
 @ray.remote
-class SharedRewardEstimator:
-    def __init__(self, estimator_class, policy_config, **kwargs):
+class SharedFQETorchModel:
+    def __init__(self, policy_config, gamma, **kwargs):
         from ray.rllib.algorithms.impala.impala_torch_policy import ImpalaTorchPolicy
+        from ray.rllib.offline.estimators.fqe_torch_model import FQETorchModel
         
         dummy_policy = ImpalaTorchPolicy(policy_config["observation_space"], policy_config["action_space"], policy_config)
-        self.estimator = estimator_class(dummy_policy, **kwargs)
+        self.model = FQETorchModel(dummy_policy, gamma, **kwargs)
 
     def train(self, batch):
-        return self.estimator.train(batch)
+        return self.model.train(batch)
 
     def get_state(self):
-        if hasattr(self.estimator, 'model') and hasattr(self.estimator.model, 'get_state'):
-            return self.estimator.model.get_state()
-        return None
-
-    def set_state(self, state):
-        if state is not None and hasattr(self.estimator, 'model') and hasattr(self.estimator.model, 'set_state'):
-            self.estimator.model.set_state(state)
-
-    def get_estimator_class(self):
-        return type(self.estimator)
+        return self.model.get_state()
