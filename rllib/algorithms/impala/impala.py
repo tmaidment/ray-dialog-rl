@@ -1163,12 +1163,6 @@ class IMPALA(Algorithm):
         self.reward_estimators = {}
         for name, shared_estimator in self.shared_reward_estimators.items():
             state = ray.get(shared_estimator.get_state.remote())
-            method_config = self.config.off_policy_estimation_methods[name].copy()
-            method_type = method_config.pop("type")
-            policy = self.get_policy()
-            if issubclass(method_type, OffPolicyEstimator):
-                method_config["gamma"] = self.config.gamma
-            self.reward_estimators[name] = method_type(policy, **method_config)
             if state is not None and hasattr(self.reward_estimators[name], 'model'):
                 self.reward_estimators[name].model.set_state(state)
         
