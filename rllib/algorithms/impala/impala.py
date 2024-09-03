@@ -1169,7 +1169,7 @@ class IMPALA(Algorithm):
             if issubclass(method_type, OffPolicyEstimator):
                 method_config["gamma"] = self.config.gamma
             self.reward_estimators[name] = method_type(policy, **method_config)
-            if state is not None and hasattr(self.estimator, 'model') and hasattr(self.estimator.model, 'set_state'):
+            if state is not None and hasattr(self.reward_estimators[name], 'model'):
                 self.reward_estimators[name].model.set_state(state)
         
         eval_results = super().evaluate(parallel_train_future)
