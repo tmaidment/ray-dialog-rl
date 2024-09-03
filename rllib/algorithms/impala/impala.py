@@ -653,15 +653,11 @@ class IMPALA(Algorithm):
             self._learner_thread = make_learner_thread(self.env_runner, self.config)
             self._learner_thread.start()
 
-            # Initialize and start the reward estimator learner thread
-            if self.reward_estimators:
-                self.reward_estimator_learner_results = {}
-                self._reward_estimator_learner_process = RewardEstimatorLearnerProcess(
-                    reward_estimators=self.reward_estimators,
-                    learner_queue_size=self.config.learner_queue_size*32,
-                    learner_queue_timeout=self.config.learner_queue_timeout
-                )
-                self._reward_estimator_learner_process.start()
+        # Create shared reward estimators as Ray actors
+        self.shared_reward_estimators = {
+            name: SharedRewardEstimator.remote(estimator_class, *args, **kwargs)
+            for name, (estimator_class, args, kwargs) in config.reward_estimators.items()
+        }
 
     @override(Algorithm)
     def training_step(self) -> ResultDict:
@@ -1070,13 +1066,6 @@ class IMPALA(Algorithm):
             self._counters[NUM_AGENT_STEPS_SAMPLED] += batch.agent_steps()
         # Concatenate single batches into batches of size `total_train_batch_size`.
         self._concatenate_batches_and_pre_queue(batches)
-        # update the reward estimators
-        for batch in self.data_to_place_on_learner:
-            if self.reward_estimators:
-                try:
-                    self._reward_estimator_learner_process.inqueue.put(batch, block=False)
-                except queue.Full:
-                    logger.warning("Reward estimator learner queue is full.")
         # Move train batches (of size `total_train_batch_size`) onto learner queue.
         self._place_processed_samples_on_learner_thread_queue()
         # Extract most recent train results from learner thread.
@@ -1100,15 +1089,41 @@ class IMPALA(Algorithm):
                 mark_healthy=True,
             )
 
-        # combine all results
-        while not self._reward_estimator_learner_process.outqueue.empty():
-            logging.info("Logging reward estimator learner results")
-            self.reward_estimator_learner_results.update(self._reward_estimator_learner_process.outqueue.get())
+        estimator_futures = []
+        for batch in self.data_to_place_on_learner:
+            for name, estimator in self.shared_reward_estimators.items():
+                estimator_futures.append(estimator.train.remote(batch))
 
-        if DEFAULT_POLICY_ID in train_results:
-            train_results[DEFAULT_POLICY_ID].update(self.reward_estimator_learner_results)
-    
+        # Collect results from reward estimators
+        estimator_results = ray.get(estimator_futures)
+
+        # Process estimator results
+        off_policy_estimation = {}
+        for name, result in zip(self.shared_reward_estimators.keys(), estimator_results):
+            off_policy_estimation[name] = result
+
+        # Add off-policy estimation results to train results
+        if DEFAULT_POLICY_ID not in train_results:
+            train_results[DEFAULT_POLICY_ID] = {}
+        train_results[DEFAULT_POLICY_ID]["off_policy_estimation"] = off_policy_estimation
+
         return train_results
+    
+    @override(Algorithm)
+    def evaluate(self):
+        # Sync reward estimators with the shared ones before evaluation
+        for name, shared_estimator in self.shared_reward_estimators.items():
+            state = ray.get(shared_estimator.get_state.remote())
+            if name not in self.reward_estimators:
+                # If the estimator doesn't exist, create it
+                estimator_class, args, kwargs = self.config.reward_estimators[name]
+                self.reward_estimators[name] = estimator_class(*args, **kwargs)
+            # Update the state of the existing estimator
+            self.reward_estimators[name].set_state(state)
+
+        eval_results = super().evaluate()
+
+        return eval_results
 
     @OldAPIStack
     def _get_samples_from_workers_old_and_hybrid_api_stack(
@@ -1578,47 +1593,16 @@ def make_learner_thread(local_worker, config):
     return learner_thread
 
 
-class RewardEstimatorLearnerProcess(mp.Process):
-    def __init__(self, reward_estimators, learner_queue_size, learner_queue_timeout):
-        super().__init__()
-        self.reward_estimators = reward_estimators
-        self.inqueue = mp.Queue(maxsize=learner_queue_size)
-        self.outqueue = mp.Queue()
-        self.learner_queue_timeout = learner_queue_timeout
-        self.stop_flag = mp.Event()
+@ray.remote
+class SharedRewardEstimator:
+    def __init__(self, estimator_class, *args, **kwargs):
+        self.estimator = estimator_class(*args, **kwargs)
 
-    def run(self):
-        while not self.stop_flag.is_set():
-            try:
-                batch = self.inqueue.get(timeout=self.learner_queue_timeout)
-                if batch is None:
-                    break
-                logger.info("Batch received by RewardEstimatorLearnerProcess")
-                
-                results = self.process_batch(batch)
-                
-                try:
-                    self.outqueue.put(results, timeout=self.learner_queue_timeout)
-                    logger.info("Results stored by RewardEstimatorLearnerProcess")
-                except mp.Queue.Full:
-                    logger.warning("Output queue is full. Results discarded.")
-            
-            except mp.Queue.Empty:
-                logger.debug("Input queue timeout. Continuing...")
-            except Exception as e:
-                logger.exception(f"Error in RewardEstimatorLearnerProcess: {e}")
+    def train(self, batch):
+        return self.estimator.train(batch)
 
-    def process_batch(self, batch):
-        results = {}
-        if self.reward_estimators:
-            results["off_policy_estimation"] = {}
-            for name, estimator in self.reward_estimators.items():
-                try:
-                    results["off_policy_estimation"][name] = estimator.train(batch)
-                except Exception as e:
-                    logger.error(f"Error training estimator {name}: {e}")
-        return results
+    def get_state(self):
+        return self.estimator.get_state()
 
-    def stop(self):
-        self.stop_flag.set()
-        self.inqueue.put(None)
+    def set_state(self, state):
+        self.estimator.set_state(state)
