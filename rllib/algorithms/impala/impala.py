@@ -674,8 +674,9 @@ class IMPALA(Algorithm):
         for name, method_config in self.config.off_policy_estimation_methods.items():
             method_type = method_config.pop("type")
             if issubclass(method_type, OffPolicyEstimator):
+                #method_config["gamma"] = self.config.gamma
                 self.shared_fqe_models[name] = SharedFQETorchModel.remote(
-                    policy_config, method_config["gamma"], **method_config
+                    policy_config, self.config.gamma, **method_config
                 )
             else:
                 raise ValueError(
