@@ -1,9 +1,13 @@
 import copy
+import concurrent
 from functools import partial
+import importlib
 import logging
+import multiprocessing as mp
 import platform
 import queue
 import random
+import threading
 from typing import List, Optional, Set, Tuple, Type, Union
 
 import numpy as np
@@ -23,8 +27,19 @@ from ray.rllib.env.env_runner_group import _handle_remote_call_result_errors
 from ray.rllib.execution.buffers.mixin_replay_buffer import MixInMultiAgentReplayBuffer
 from ray.rllib.execution.learner_thread import LearnerThread
 from ray.rllib.execution.multi_gpu_learner_thread import MultiGPULearnerThread
+from ray.rllib.offline.estimators.off_policy_estimator import OffPolicyEstimator
+from ray.rllib.offline.offline_evaluator import OfflineEvaluator
+from ray.rllib.offline.estimators import (
+    OffPolicyEstimator,
+    ImportanceSampling,
+    WeightedImportanceSampling,
+    DirectMethod,
+    DoublyRobust,
+)
 from ray.rllib.policy.policy import Policy
+from ray.rllib.policy.sample_batch import DEFAULT_POLICY_ID
 from ray.rllib.policy.sample_batch import concat_samples
+from ray.rllib.policy.sample_batch import MultiAgentBatch
 from ray.rllib.utils.actor_manager import (
     FaultAwareApply,
     FaultTolerantActorManager,
@@ -33,6 +48,7 @@ from ray.rllib.utils.actor_manager import (
 from ray.rllib.utils.actors import create_colocated_actors
 from ray.rllib.utils.annotations import OldAPIStack, override
 from ray.rllib.utils.deprecation import DEPRECATED_VALUE, deprecation_warning
+from ray.rllib.utils.framework import try_import_torch
 from ray.rllib.utils.metrics import (
     ALL_MODULES,
     ENV_RUNNER_RESULTS,
@@ -70,6 +86,8 @@ from ray.rllib.utils.typing import (
 )
 from ray.tune.execution.placement_groups import PlacementGroupFactory
 from ray.util.annotations import DeveloperAPI
+
+torch, nn = try_import_torch()
 
 
 logger = logging.getLogger(__name__)
@@ -646,6 +664,46 @@ class IMPALA(Algorithm):
             self._learner_thread = make_learner_thread(self.env_runner, self.config)
             self._learner_thread.start()
 
+        # Initialize shared reward estimators
+        self.shared_reward_estimators = {}
+        ope_types = {
+            "is": ImportanceSampling,
+            "wis": WeightedImportanceSampling,
+            "dm": DirectMethod,
+            "dr": DoublyRobust,
+        }
+
+        policy = self.get_policy()
+        policy_config = policy.config.copy()
+        policy_config["observation_space"] = policy.observation_space
+        policy_config["action_space"] = policy.action_space
+
+        for name, method_config in self.config.off_policy_estimation_methods.items():
+            method_type = method_config.pop("type")
+            if method_type in ope_types:
+                method_type = ope_types[method_type]
+            elif isinstance(method_type, str):
+                logger.log(0, f"Trying to import from string: {method_type}")
+                mod, obj = method_type.rsplit(".", 1)
+                mod = importlib.import_module(mod)
+                method_type = getattr(mod, obj)
+
+            if isinstance(method_type, type) and issubclass(method_type, OfflineEvaluator):
+                if issubclass(method_type, OffPolicyEstimator):
+                    method_config["gamma"] = self.config.gamma
+                self.shared_reward_estimators[name] = SharedRewardEstimator.remote(
+                    method_type, policy_config, **method_config
+                )
+            else:
+                raise ValueError(
+                    f"Unknown off_policy_estimation type: {method_type}! Must be "
+                    "either a class path or a sub-class of ray.rllib."
+                    "offline.offline_evaluator::OfflineEvaluator"
+                )
+
+            # Add back method_type in case Algorithm is restored from checkpoint
+            method_config["type"] = method_type
+
     @override(Algorithm)
     def training_step(self) -> ResultDict:
         # Old- and hybrid API stacks.
@@ -1053,6 +1111,11 @@ class IMPALA(Algorithm):
             self._counters[NUM_AGENT_STEPS_SAMPLED] += batch.agent_steps()
         # Concatenate single batches into batches of size `total_train_batch_size`.
         self._concatenate_batches_and_pre_queue(batches)
+        # Move train batches to the reward_estimator_trainer
+        estimator_futures = []
+        for batch in self.data_to_place_on_learner:
+            for name, estimator in self.shared_reward_estimators.items():
+                estimator_futures.append(estimator.train.remote(batch))
         # Move train batches (of size `total_train_batch_size`) onto learner queue.
         self._place_processed_samples_on_learner_thread_queue()
         # Extract most recent train results from learner thread.
@@ -1076,7 +1139,42 @@ class IMPALA(Algorithm):
                 mark_healthy=True,
             )
 
+        # Collect results from reward estimators
+        estimator_results = ray.get(estimator_futures)
+
+        # Process estimator results
+        off_policy_estimation = {}
+        for name, result in zip(self.shared_reward_estimators.keys(), estimator_results):
+            off_policy_estimation[name] = result
+
+        # Add off-policy estimation results to train results
+        if DEFAULT_POLICY_ID not in train_results:
+            train_results[DEFAULT_POLICY_ID] = {}
+        train_results[DEFAULT_POLICY_ID]["off_policy_estimation"] = off_policy_estimation
+
         return train_results
+    
+    @override(Algorithm)
+    def evaluate(
+        self,
+        parallel_train_future: Optional[concurrent.futures.ThreadPoolExecutor] = None,
+    ) -> ResultDict:
+        # Sync reward estimators with the shared ones before evaluation
+        self.reward_estimators = {}
+        for name, shared_estimator in self.shared_reward_estimators.items():
+            state = ray.get(shared_estimator.get_state.remote())
+            method_config = self.config.off_policy_estimation_methods[name].copy()
+            method_type = method_config.pop("type")
+            policy = self.get_policy()
+            if issubclass(method_type, OffPolicyEstimator):
+                method_config["gamma"] = self.config.gamma
+            self.reward_estimators[name] = method_type(policy, **method_config)
+            if state is not None and hasattr(self.reward_estimators[name], 'model'):
+                self.reward_estimators[name].model.set_state(state)
+        
+        eval_results = super().evaluate(parallel_train_future)
+
+        return eval_results
 
     @OldAPIStack
     def _get_samples_from_workers_old_and_hybrid_api_stack(
@@ -1447,7 +1545,6 @@ class IMPALA(Algorithm):
             )
         return result
 
-
 Impala = IMPALA
 
 
@@ -1545,3 +1642,27 @@ def make_learner_thread(local_worker, config):
             learner_queue_timeout=config["learner_queue_timeout"],
         )
     return learner_thread
+
+
+@ray.remote
+class SharedRewardEstimator:
+    def __init__(self, estimator_class, policy_config, **kwargs):
+        from ray.rllib.algorithms.impala.impala_torch_policy import ImpalaTorchPolicy
+        
+        dummy_policy = ImpalaTorchPolicy(policy_config["observation_space"], policy_config["action_space"], policy_config)
+        self.estimator = estimator_class(dummy_policy, **kwargs)
+
+    def train(self, batch):
+        return self.estimator.train(batch)
+
+    def get_state(self):
+        if hasattr(self.estimator, 'model') and hasattr(self.estimator.model, 'get_state'):
+            return self.estimator.model.get_state()
+        return None
+
+    def set_state(self, state):
+        if state is not None and hasattr(self.estimator, 'model') and hasattr(self.estimator.model, 'set_state'):
+            self.estimator.model.set_state(state)
+
+    def get_estimator_class(self):
+        return type(self.estimator)
